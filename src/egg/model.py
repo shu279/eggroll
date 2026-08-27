@@ -63,6 +63,8 @@ class EggConfig:
             raise ValueError(
                 "hidden_size must be a perfect square (for example 16, 64, or 256)"
             )
+        if self.hidden_size % 16 != 0:
+            raise ValueError("hidden_size must be divisible by 16 for INT8 GEMM alignment")
         if self.layers <= 0:
             raise ValueError("layers must be positive")
         if self.expansion != 4:
@@ -122,6 +124,32 @@ def noisy_vector(
     return clip_i8(value.to(torch.int32) + _shift_noise(noise.value, sign, sigma_shift))
 
 
+def int8_mm_accumulate(x: Tensor, weight: Tensor) -> Tensor:
+    """INT8 GEMM with INT32 accumulation.
+
+    ``torch.mm`` returns int8 for int8 inputs and can overflow. PyTorch's
+    ``torch._int_mm`` is the accumulating kernel lowered by Inductor to ATen,
+    Triton, or CUTLASS on CUDA. The right-hand side is intentionally a
+    column-major transpose view; making it contiguous is slower on CUDA.
+    """
+
+    if x.dtype != torch.int8 or weight.dtype != torch.int8:
+        raise TypeError("int8_mm_accumulate expects int8 inputs")
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError("input and weight widths must match")
+
+    leading_shape = x.shape[:-1]
+    flat_x = x.reshape(-1, x.shape[-1]).contiguous()
+    weight_t = weight.transpose(0, 1)
+    if hasattr(torch, "_int_mm") and flat_x.device.type in ("cpu", "cuda"):
+        output = torch._int_mm(flat_x, weight_t)
+    else:
+        # Portability fallback for backends such as MPS. This path is correct,
+        # but does not claim Tensor Core throughput.
+        output = flat_x.to(torch.int32) @ weight_t.to(torch.int32)
+    return output.reshape(*leading_shape, weight.shape[0])
+
+
 def scaled_mm(
     x: Tensor,
     weight: Tensor,
@@ -141,15 +169,17 @@ def scaled_mm(
     if root * root != in_size:
         raise ValueError(f"matrix input width {in_size} must be a perfect square")
 
-    x32 = x.to(torch.int32)
-    result = torch.matmul(x32, weight.to(torch.int32).transpose(-1, -2))
+    result = int8_mm_accumulate(x, weight)
     if noise is not None:
-        projected = torch.matmul(
-            x32.unsqueeze(-2), noise.b.to(torch.int32)
-        ).squeeze(-2)
-        low_rank = torch.matmul(
-            projected.unsqueeze(-2), noise.a.to(torch.int32).transpose(-1, -2)
-        ).squeeze(-2)
+        # The unique low-rank term is bandwidth-cheap compared with the shared
+        # base GEMM. Elementwise products plus reductions avoid a batched dense
+        # matrix multiply for every population member.
+        projected = (
+            x.unsqueeze(-1).to(torch.int32) * noise.b.to(torch.int32)
+        ).sum(dim=-2, dtype=torch.int32)
+        low_rank = (
+            projected.unsqueeze(-2) * noise.a.to(torch.int32)
+        ).sum(dim=-1, dtype=torch.int32)
         result = result + _shift_noise(low_rank, sign, sigma_shift)
 
     scaled = torch.div(result, FIXED_POINT_SCALE * root, rounding_mode="floor")
@@ -173,10 +203,9 @@ def embedding_lookup(
             selected_a = noise.a[batch_index, token]
         else:
             selected_a = noise.a[token]
-        low_rank_row = torch.matmul(
-            selected_a.to(torch.int32).unsqueeze(-2),
-            noise.b.to(torch.int32).transpose(-1, -2),
-        ).squeeze(-2)
+        low_rank_row = (
+            selected_a.to(torch.int32).unsqueeze(-2) * noise.b.to(torch.int32)
+        ).sum(dim=-1, dtype=torch.int32)
         result = result + _shift_noise(low_rank_row, sign, sigma_shift)
     return clip_i8(result)
 

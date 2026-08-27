@@ -1,8 +1,15 @@
 import numpy as np
+import pytest
 import torch
 
 from egg.fitness import fixed_log2_q4, token_log_likelihood_q4
-from egg.model import EggConfig, EggModel, layer_norm_l1, parameter_count
+from egg.model import (
+    EggConfig,
+    EggModel,
+    int8_mm_accumulate,
+    layer_norm_l1,
+    parameter_count,
+)
 
 
 def test_parameter_count_matches_paper_formula():
@@ -14,6 +21,20 @@ def test_parameter_count_matches_paper_formula():
     assert parameter_count(model) == expected
     assert all(parameter.dtype == torch.int8 for parameter in model.parameters())
     assert all(not parameter.requires_grad for parameter in model.parameters())
+
+
+def test_hidden_size_requires_integer_gemm_alignment():
+    with pytest.raises(ValueError, match="divisible by 16"):
+        EggConfig(hidden_size=25)
+
+
+def test_int8_mm_uses_int32_accumulation_without_overflow():
+    x = torch.full((3, 16), 127, dtype=torch.int8)
+    weight = torch.full((5, 16), 127, dtype=torch.int8)
+    actual = int8_mm_accumulate(x, weight)
+    expected = torch.full((3, 5), 127 * 127 * 16, dtype=torch.int32)
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected)
 
 
 def test_forward_shapes_dtype_and_range():
