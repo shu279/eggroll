@@ -55,7 +55,7 @@ def token_log_likelihood_q4(logits: Tensor, targets: Tensor) -> Tensor:
     return target_logits - fixed_log2_q4(exp_sum_q4)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def sequence_log_likelihood_q4(
     model: EggModel,
     tokens: Tensor,

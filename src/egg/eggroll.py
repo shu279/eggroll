@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from scipy.stats import norm
@@ -27,6 +28,7 @@ class EggRollConfig:
     rank: int = 1
     sigma_shift: int = 4
     alpha: float = 0.1
+    pair_chunk_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.population_size < 2 or self.population_size % 2:
@@ -37,6 +39,13 @@ class EggRollConfig:
             raise ValueError("sigma_shift must be non-negative")
         if not 0.0 < self.alpha <= 1.0:
             raise ValueError("alpha must be in (0, 1]")
+        if self.pair_chunk_size is not None and self.pair_chunk_size <= 0:
+            raise ValueError("pair_chunk_size must be positive")
+        if (
+            self.pair_chunk_size is not None
+            and self.pair_count % self.pair_chunk_size != 0
+        ):
+            raise ValueError("pair_chunk_size must divide the antithetic pair count")
 
     @property
     def pair_count(self) -> int:
@@ -55,7 +64,7 @@ def _normal_i8(
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def sample_noise(
     model: EggModel,
     generator: torch.Generator,
@@ -91,7 +100,7 @@ def sample_noise(
     return noise
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_antithetic_pairs(
     model: EggModel,
     noise: NoiseTree,
@@ -107,6 +116,29 @@ def evaluate_antithetic_pairs(
         model, token_batches, noise, sign=-1, sigma_shift=sigma_shift
     )
     return torch.stack((positive, negative), dim=-1)
+
+
+PopulationEvaluator = Callable[[NoiseTree, Tensor], Tensor]
+
+
+def make_population_evaluator(
+    model: EggModel,
+    sigma_shift: int = 4,
+    compile_model: bool = False,
+    compile_mode: str = "max-autotune",
+) -> PopulationEvaluator:
+    """Create an eager or TorchInductor population evaluator.
+
+    Static population chunk and sequence shapes allow CUDA graph capture and
+    kernel autotuning. The first compiled call is intentionally much slower.
+    """
+
+    def evaluate(noise: NoiseTree, token_batches: Tensor) -> Tensor:
+        return evaluate_antithetic_pairs(model, noise, token_batches, sigma_shift)
+
+    if not compile_model:
+        return evaluate
+    return torch.compile(evaluate, dynamic=False, mode=compile_mode)
 
 
 def shape_fitness(pair_scores: Tensor) -> Tensor:
@@ -142,26 +174,46 @@ def update_threshold(alpha: float, pair_count: int) -> int:
     return int(round(norm.ppf(1.0 - alpha / 2.0) * 256.0 * math.sqrt(pair_count)))
 
 
-@torch.inference_mode()
-def update_model_(
-    model: EggModel,
+@torch.no_grad()
+def init_directions(model: EggModel) -> dict[str, Tensor]:
+    """Allocate one int32 fused-update tensor per model parameter."""
+
+    return {
+        name: torch.zeros_like(parameter, dtype=torch.int32)
+        for name, parameter in model.named_parameters()
+    }
+
+
+@torch.no_grad()
+def accumulate_directions_(
+    directions: dict[str, Tensor],
     noise: NoiseTree,
     fitness: Tensor,
-    alpha: float = 0.1,
-) -> EggModel:
-    """Update int8 parameters in-place by at most one integer bin.
+) -> dict[str, Tensor]:
+    """Fuse one population chunk into persistent full-rank directions."""
 
-    The trailing underscore follows the PyTorch convention for in-place ops.
-    """
-
-    threshold = update_threshold(alpha, int(fitness.shape[0]))
-    for name, parameter in model.named_parameters():
-        one_noise = noise[name]
-        direction = (
+    for name, one_noise in noise.items():
+        chunk_direction = (
             _matrix_direction(one_noise, fitness)
-            if parameter.ndim == 2
+            if isinstance(one_noise, LowRankNoise)
             else _dense_direction(one_noise, fitness)
         )
+        directions[name].add_(chunk_direction)
+    return directions
+
+
+@torch.no_grad()
+def apply_directions_(
+    model: EggModel,
+    directions: dict[str, Tensor],
+    alpha: float,
+    pair_count: int,
+) -> EggModel:
+    """Apply a fused direction to int8 parameters by at most one bin."""
+
+    threshold = update_threshold(alpha, pair_count)
+    for name, parameter in model.named_parameters():
+        direction = directions[name]
         movement = torch.where(
             direction.abs() >= threshold,
             direction.sign(),
@@ -173,3 +225,57 @@ def update_model_(
             .to(torch.int8)
         )
     return model
+
+
+@torch.no_grad()
+def update_model_(
+    model: EggModel,
+    noise: NoiseTree,
+    fitness: Tensor,
+    alpha: float = 0.1,
+) -> EggModel:
+    """One-shot in-place update kept as a convenient small-population API."""
+
+    directions = init_directions(model)
+    accumulate_directions_(directions, noise, fitness)
+    return apply_directions_(model, directions, alpha, int(fitness.shape[0]))
+
+
+@torch.no_grad()
+def eggroll_step(
+    model: EggModel,
+    generator: torch.Generator,
+    token_batches: Tensor,
+    config: EggRollConfig,
+    evaluator: PopulationEvaluator | None = None,
+) -> Tensor:
+    """Evaluate and update one generation with bounded GPU memory.
+
+    ``token_batches`` contains one sequence per antithetic pair. Noise is
+    generated and discarded chunk-by-chunk; only full-size int32 update
+    directions persist. This makes very large populations possible without
+    storing all A/B factors at once.
+    """
+
+    if token_batches.ndim != 2:
+        raise ValueError("token_batches must have shape [pair_count, time]")
+    if token_batches.shape[0] != config.pair_count:
+        raise ValueError(
+            f"expected {config.pair_count} pairs, got {token_batches.shape[0]}"
+        )
+    if evaluator is None:
+        evaluator = make_population_evaluator(model, config.sigma_shift)
+
+    chunk_size = config.pair_chunk_size or config.pair_count
+    directions = init_directions(model)
+    all_scores = []
+    for start in range(0, config.pair_count, chunk_size):
+        stop = min(start + chunk_size, config.pair_count)
+        noise = sample_noise(model, generator, stop - start, config.rank)
+        scores = evaluator(noise, token_batches[start:stop])
+        fitness = shape_fitness(scores)
+        accumulate_directions_(directions, noise, fitness)
+        all_scores.append(scores)
+
+    apply_directions_(model, directions, config.alpha, config.pair_count)
+    return torch.cat(all_scores, dim=0)

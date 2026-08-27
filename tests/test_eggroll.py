@@ -1,6 +1,8 @@
 import torch
 
 from egg.eggroll import (
+    EggRollConfig,
+    eggroll_step,
     evaluate_antithetic_pairs,
     sample_noise,
     shape_fitness,
@@ -54,3 +56,24 @@ def test_update_moves_each_weight_by_at_most_one_bin():
         assert difference.abs().max().item() <= 1
         total_changes += (difference != 0).sum().item()
     assert total_changes > 0
+
+
+def test_streaming_step_chunks_population_and_updates_once():
+    torch.manual_seed(5)
+    model = EggModel(EggConfig(hidden_size=16, layers=1))
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    config = EggRollConfig(
+        population_size=8, pair_chunk_size=2, rank=1, alpha=1.0
+    )
+    tokens = torch.tensor(
+        [[0, 1, 2, 3], [0, 3, 2, 1], [0, 4, 5, 6], [0, 6, 5, 4]],
+        dtype=torch.uint8,
+    )
+    scores = eggroll_step(
+        model, torch.Generator().manual_seed(6), tokens, config
+    )
+    assert scores.shape == (4, 2)
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in model.named_parameters()
+    )

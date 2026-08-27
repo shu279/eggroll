@@ -12,10 +12,9 @@ from torch import Tensor
 from .checkpoint import save_checkpoint
 from .eggroll import (
     EggRollConfig,
-    evaluate_antithetic_pairs,
-    sample_noise,
+    eggroll_step,
+    make_population_evaluator,
     shape_fitness,
-    update_model_,
 )
 from .fitness import bits_per_byte, sequence_log_likelihood_q4
 from .model import EggConfig, EggModel, parameter_count
@@ -72,6 +71,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--sigma-shift", type=int, default=4)
     parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument(
+        "--pair-chunk-size",
+        type=int,
+        help="antithetic pairs evaluated at once; omitted evaluates all pairs",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="use torch.compile (default: enabled on CUDA)",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        default="max-autotune",
+        choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--checkpoint", default="checkpoints/egg-small.pt")
@@ -93,10 +108,18 @@ def main(argv: list[str] | None = None) -> None:
         rank=args.rank,
         sigma_shift=args.sigma_shift,
         alpha=args.alpha,
+        pair_chunk_size=args.pair_chunk_size,
     )
     data = _load_bytes(args.data)
     host_rng = np.random.default_rng(args.seed)
     noise_generator = torch.Generator(device=device).manual_seed(args.seed + 1)
+    compile_enabled = args.compile if args.compile is not None else device.type == "cuda"
+    evaluator = make_population_evaluator(
+        model,
+        sigma_shift=roll.sigma_shift,
+        compile_model=compile_enabled,
+        compile_mode=args.compile_mode,
+    )
 
     validation = torch.as_tensor(
         data[: min(data.size, 513)], dtype=torch.uint8, device=device
@@ -108,15 +131,13 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     for step in range(args.steps):
-        noise = sample_noise(model, noise_generator, roll.pair_count, roll.rank)
         batches = _sample_batches(
             data, roll.pair_count, args.sequence_length, host_rng, device
         )
-        pair_scores = evaluate_antithetic_pairs(
-            model, noise, batches, sigma_shift=roll.sigma_shift
+        pair_scores = eggroll_step(
+            model, noise_generator, batches, roll, evaluator
         )
         fitness = shape_fitness(pair_scores)
-        update_model_(model, noise, fitness, roll.alpha)
 
         mean_bpb = -pair_scores.to(torch.float32).mean().item() / (
             args.sequence_length * 16.0

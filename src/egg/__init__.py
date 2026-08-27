@@ -3,7 +3,9 @@
 from .checkpoint import load_checkpoint, save_checkpoint
 from .eggroll import (
     EggRollConfig,
+    eggroll_step,
     evaluate_antithetic_pairs,
+    make_population_evaluator,
     sample_noise,
     shape_fitness,
     update_model_,
@@ -18,8 +20,10 @@ __all__ = [
     "EggRollConfig",
     "LowRankNoise",
     "bits_per_byte",
+    "eggroll_step",
     "evaluate_antithetic_pairs",
     "load_checkpoint",
+    "make_population_evaluator",
     "parameter_count",
     "sample_noise",
     "save_checkpoint",
