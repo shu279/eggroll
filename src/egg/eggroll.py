@@ -1,4 +1,4 @@
-"""PyTorch implementation of integer EGGROLL for the EGG model."""
+"""EGGROLL Optimiser: antithetic population-based Q4 updates for int8 PyTorch models."""
 
 from __future__ import annotations
 
