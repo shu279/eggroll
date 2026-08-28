@@ -31,6 +31,16 @@ egg-train \
   --steps 100
 ```
 
+### Key parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `--population` | Total number of mutated models evaluated per generation. Half use `+noise` and half use `-noise`. |
+| `--rank` | Rank of the low-rank mutation. Higher values make mutations more expressive but use more compute and memory. |
+| `--sigma-shift` | Mutation scale, approximately `2^-sigma_shift`. Larger values produce smaller mutations. |
+| `--alpha` | Statistical significance level for changing an INT8 weight by one step. Smaller values make updates more conservative. |
+| `--pair-chunk-size` | Number of antithetic pairs evaluated at once. Smaller chunks use less GPU memory. It must divide `population / 2`. |
+
 ## Benchmark
 
 ```bash
